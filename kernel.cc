@@ -18,10 +18,11 @@
 #include <gsl/gsl_vector.h>
 #include <gsl/gsl_blas.h>
 
+#include "a1a2.h"
 #include "kernel.h"
 #include "klbasis.h"
 
-gsl_matrix *calc_kernel0(int order, int ngrid, double *A1, double A2, gsl_matrix **weightMat) {
+gsl_matrix *calc_kernel(int q, int order, int ngrid, gsl_matrix **weightMat) {
 	double tmp;
 	// Allocate memory for kernel and weight matrix
 	gsl_matrix *kernelS = gsl_matrix_alloc(ngrid, ngrid);
@@ -29,35 +30,20 @@ gsl_matrix *calc_kernel0(int order, int ngrid, double *A1, double A2, gsl_matrix
 	// Construct weight matrix
 	*weightMat = calc_weights(order, ngrid);
 	
-	// Calculate kernel matrix
-	for (int i=0; i<ngrid; i++) {
-		for (int j=i; j<ngrid; j++) {
-			// Kernel is symmetric, so we only need to calculate one half
-			tmp = calc_Sq(i*1./(ngrid-1), j*1./(ngrid-1), q);
-			gsl_matrix_set(kernelS, i, j, tmp);
-			gsl_matrix_set(kernelS, j, i, tmp);
-		}
+	double A2=0., A1[ngrid];
+	if (q == 0) {
+		printf("Pre-computing A1(r), should only happen once for q=0.\n");
+		for (int i=0; i<ngrid; i++)
+			A1[i] = calc_A1(i*1.0/(ngrid-1.));
+		A2 = calc_A2();
+		printf("Pre-computing A1(r) done.\n");		
 	}
 	
-	// Apply weight to matrix
-	gsl_matrix_mul_elements(kernelS, *weightMat);
-	
-	return kernelS;
-}
-
-gsl_matrix *calc_kernelq(int q, int order, int ngrid, gsl_matrix **weightMat) {
-	double tmp;
-	// Allocate memory for kernel and weight matrix
-	gsl_matrix *kernelS = gsl_matrix_alloc(ngrid, ngrid);
-	
-	// Construct weight matrix
-	*weightMat = calc_weights(order, ngrid);
-	
 	// Calculate kernel matrix
 	for (int i=0; i<ngrid; i++) {
 		for (int j=i; j<ngrid; j++) {
 			// Kernel is symmetric, so we only need to calculate one half
-			tmp = calc_Sq(i*1./(ngrid-1), j*1./(ngrid-1), q);
+			tmp = calc_Sq(q, i, j, ngrid, A1, A2);
 			gsl_matrix_set(kernelS, i, j, tmp);
 			gsl_matrix_set(kernelS, j, i, tmp);
 		}
@@ -139,34 +125,38 @@ int newtoncotes_factors(int order, double factors[]) {
 }
 
 // Calculate S_q(r,r`) (Dai (2001), Eqn. 38)
-double calc_Sq(double r, double rp, int q) {
-	if (r == 0 || rp == 0) 
+double calc_Sq(int q, int i, int j, int ngrid, double *A1, double A2) {
+	if (i == 0 || j == 0)
 		return 0;
 	
-	// Setup integration parameters
-//	static gsl_integration_workspace * w = gsl_integration_workspace_alloc (1000);
-//	static gsl_integration_qawo_table * qawo_table = 
-//		gsl_integration_qawo_table_alloc(q, 2 * M_PI, GSL_INTEG_COSINE, 16);
-	
-	static gsl_integration_glfixed_table *gl_table = gsl_integration_glfixed_table_alloc (100);
-	
-	static gsl_function F;
+	// Calculate position on [0,1] scale
+	double r = i*1./(ngrid-1);
+	double rp = j*1./(ngrid-1);
+
+	gsl_integration_glfixed_table *gl_table = gsl_integration_glfixed_table_alloc (25 + 3*q);
+	gsl_function F;
 	double result, error;
 	
 	// This should be a0 = 0.3450933461
 	static const double a0 = pow(24./5 * gsl_sf_gamma(6./5), 5./6) / (pow(2., 5./3) * M_PI);
 	
-	// Calculate the integration part
-	double inparms[3] = {r, rp, q};
-//	F.function = &calc_Sq_f1;
-	F.function = &calc_Sq_f1c;
+	// Setup integration parameters
+	double inparms[3] = {r, rp, q}, term=0.0;
+	
+	if (q!=0)
+		F.function = &calc_Sq_f1c;
+	else {
+		F.function = &calc_Sq_f1;
+		term = 2 * a0 * sqrt(rp) * sqrt(r) * (A1[i] + A1[j] - A2);
+	}
 	F.params = inparms;
 	
+	// Calculate the integration part
 	result = gsl_integration_glfixed(&F, 0.0, 2 * M_PI, gl_table);
-//	gsl_integration_qawo (&F, 0.0, ABSERR, RELERR, 1000, w, qawo_table, 
-//						  &result, &error);
 	
-	return -a0 * sqrt(rp) * sqrt(r) * result;
+	gsl_integration_glfixed_table_free(gl_table);
+
+	return -a0 * sqrt(rp) * sqrt(r) * result + term;
 }
 
 // Integration function for calc_Sq() without cosine factor
@@ -197,7 +187,7 @@ double calc_Sq_f1c(double thpp, void *params) {
 
 #ifdef COS_LUT_SIZE
 	static int have_table = 0;
-	static double cos_LUT[COS_LUT_SIZE];
+	double cos_LUT[COS_LUT_SIZE];
 	if (have_table == 0) {
 		printf("Using cosine LUT for calc_Sq_f1c(), this should be calculated only once...\n");
 		for (int i=0; i<COS_LUT_SIZE; i++)

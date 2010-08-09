@@ -19,9 +19,13 @@
 
 #include <stdio.h>
 #include <getopt.h>
+#include <stdlib.h>
+#include <pthread.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_vector.h>
+#include <gsl/gsl_sort_vector.h>
 #include <gsl/gsl_eigen.h>
+#include <gsl/gsl_permutation.h>
 
 #include "a1a2.h"
 #include "kernel.h"
@@ -52,19 +56,138 @@ void show_clihelp(char *execname, bool error = false) {
 	}
 }
 
+void *thread_worker(void *arg) {
+	thr_info *info = (thr_info *) arg;
+	int id = info->id;
+	int minq = info->minq;
+	int maxq = info->maxq;
+	struct _kl_modes *kl_modes = info->kl_modes;
+	struct _kl_config *cfg = info->cfg;
+	
+	// Now calculate the rest, loop over all other values of q
+	for (int q=minq; q<=maxq; q += cfg->nthreads) {
+		printf("Thread %d working on Q=%d.\n", id, q);
+		calc_kl(q, cfg, kl_modes);
+	}
+	
+	return NULL;
+}
+
+int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
+	//printf("Calculating KL modes for q=%d. order=%d, ngrid=%d\n", q, cfg->order, cfg->ngrid);
+	gsl_matrix *kernelS, *weightMat;	// Integration kernel to be inverted
+	gsl_eigen_symmv_workspace *w = gsl_eigen_symmv_alloc(cfg->ngrid);
+	gsl_vector *tmp_col = gsl_vector_alloc(cfg->ngrid);
+	gsl_vector *eigenV = gsl_vector_alloc(cfg->ngrid); // Store eigenvectors for specific Q here
+	gsl_matrix *eigenF = gsl_matrix_alloc(cfg->ngrid, cfg->ngrid); // Store eigenfunctions for specific Q here
+	
+	// Try to load from cache
+	if (cfg->cache &&
+		!gsl_restore_matrix(format("klcache-eigenF_q=%d.gsl", q), eigenF) &&
+		!gsl_restore_vector(format("klcache-eigenV_q=%d.gsl", q), eigenV))
+		printf("Restored first set of eigenfunction & -values for q=%d from cache.\n", q);
+	// Otherwise calculate...
+	else {
+		//printf("Calculating intergration kernel S_q=%d...\n", q);
+		// Build kernel matrix S_q (Dai Eqn. 42)
+		kernelS = calc_kernel(q, cfg->order, cfg->ngrid, &weightMat);
+		//printf("Solving eigensystem...\n");
+		// Solve eigensystem into eigenfunctions & -values
+		gsl_eigen_symmv (kernelS, eigenV, eigenF, w);
+	}
+	
+	// First set gets special treatment
+	if (out->limit == 0.0) {
+		out->limit = gsl_vector_get(eigenV, 1);
+		int p = 1;
+		printf("Keeping first eigenvalue @ q=%d, p=%d, value=%.16f\n", q, p, out->limit);
+		
+		if (out->nm == out->nalloc) {
+			fprintf(stderr, "Please increase ALLOCSIZE...\n");
+			exit(-1);
+		}
+
+		gsl_vector_set(out->eigv, out->nm, out->limit);
+		gsl_matrix_get_col(tmp_col, eigenF, 1);
+		gsl_matrix_set_col(out->eigf, out->nm, tmp_col);
+		gsl_matrix_uint_set(out->pq, 0, out->nm, p);
+		gsl_matrix_uint_set(out->pq, 1, out->nm, q);
+		out->nm++;
+	}
+	// Store regular modes & values here
+	else {
+		int p=1;
+		for (int i=1; i<cfg->ngrid && gsl_vector_get(eigenV, i)>=out->limit; i++, p++) {
+			double vec = gsl_vector_get(eigenV, i);
+			if (vec < 0) {
+				fprintf(stderr, "Eigenvalue @ q=%d, p=%d, value=%g is negative! Abort!\n", q, p, vec);
+				return -1;
+			}
+			//printf("Keeping eigenvalue @ q=%d, p=%d, value=%.16f\n", q, p, vec);
+			
+			pthread_mutex_lock(&(out->lock));
+			if (out->nm == out->nalloc) {
+				// Allocate new bigger data
+				gsl_vector *tmp_eigv = gsl_vector_calloc(out->nalloc + ALLOCSIZE);
+				gsl_matrix *tmp_eigf = gsl_matrix_alloc(cfg->ngrid, out->nalloc + ALLOCSIZE);
+				gsl_matrix_uint *tmp_pq = gsl_matrix_uint_alloc(2, out->nalloc + ALLOCSIZE);
+				out->nalloc += ALLOCSIZE;
+				
+				// Copy from old to new
+				for (int i=0; i<out->nm; i++) {
+					gsl_vector_set(tmp_eigv, i, gsl_vector_get(out->eigv, i));
+					gsl_matrix_get_col(tmp_col, out->eigf, i);
+					gsl_matrix_set_col(tmp_eigf, i, tmp_col);
+					int p = gsl_matrix_uint_get(out->pq, 0, i);
+					int q = gsl_matrix_uint_get(out->pq, 1, i);
+					gsl_matrix_uint_set(tmp_pq, 0, i, p);
+					gsl_matrix_uint_set(tmp_pq, 1, i, q);
+				}
+				
+				gsl_vector_free(out->eigv);
+				gsl_matrix_free(out->eigf);
+				gsl_matrix_uint_free(out->pq);
+				out->eigv = tmp_eigv;
+				out->eigf = tmp_eigf;
+				out->pq = tmp_pq;
+			}
+			gsl_vector_set(out->eigv, out->nm, vec);
+			gsl_matrix_get_col(tmp_col, eigenF, i);
+			gsl_matrix_set_col(out->eigf, out->nm, tmp_col);
+			gsl_matrix_uint_set(out->pq, 0, out->nm, p);
+			gsl_matrix_uint_set(out->pq, 1, out->nm, q);
+			out->nm++;
+			pthread_mutex_unlock(&(out->lock));
+		}
+	}
+	
+	// TODO: Normalize and convert to Karhunen-Loève functions
+	
+	// Cache to disk
+	if (cfg->cache) {
+		gsl_store_matrix(format("klcache-eigenF_q=%d", q), eigenF, true, true);
+		gsl_store_vector(format("klcache-eigenV_q=%d", q), eigenV, true, true);
+	}
+	
+	return 0;
+}
+
 
 int main(int argc, char *argv[]) {
 	// Parse command line options
 	int r, option_index = 0;
+	struct _kl_config cfg;
 	
-	int ngrid=253;		// Number of gridpoints to solve eigenfunctions on
-	int order=4;		// Interpolation order to use
-	int cache=0;		// Cache intermediate results
-	int minQ=0;			// Minimum value of q to try
-	int maxQ=2;			// Maximum value of q to try
-	
+	cfg.ngrid = 253;
+	cfg.order = 4;
+	cfg.cache = 0;
+	cfg.minQ = 0;
+	cfg.maxQ = 2;
+	cfg.nthreads = 2;
+
 	static struct option const long_options[] = {
 		{"ngrid", required_argument, NULL, 'n'},
+		{"threads", required_argument, NULL, 't'},
 		{"maxq", required_argument, NULL, 3},
 		{"minq", required_argument, NULL, 4},
 		{"order", required_argument, NULL, 'o'},
@@ -74,15 +197,15 @@ int main(int argc, char *argv[]) {
 		{NULL, 0, NULL, 0}
 	};
 	
-	while((r = getopt_long(argc, argv, "c:hv", long_options, &option_index)) != EOF) {
+	while((r = getopt_long(argc, argv, "c:hvt:n:o:", long_options, &option_index)) != EOF) {
 		switch(r) {
 			case 0:
 				break;
 			case 'n':
-				ngrid = (int) atoi(optarg);
+				cfg.ngrid = (int) atoi(optarg);
 				break;
 			case 'o':
-				order = (int) atoi(optarg);
+				cfg.order = (int) atoi(optarg);
 				break;
 			case 'h':
 				show_clihelp(argv[0]);
@@ -91,13 +214,16 @@ int main(int argc, char *argv[]) {
 				show_version();
 				return -1;
 			case 2:
-				cache = 1;
+				cfg.cache = 1;
+				break;
+			case 't':
+				cfg.nthreads = atoi(optarg);
 				break;
 			case 3:
-				maxQ = atoi(optarg);
+				cfg.maxQ = atoi(optarg);
 				break;
 			case 4:
-				minQ = atoi(optarg);
+				cfg.minQ = atoi(optarg);
 				break;
 			case '?':
 				show_clihelp(argv[0], true);
@@ -108,102 +234,73 @@ int main(int argc, char *argv[]) {
 	}
 	
 	// Check options
-	if ((ngrid-1)/order != (ngrid-1)*1.0/order) {
-		ngrid = (ngrid-1)/order * order + order + 1;
-		fprintf(stderr, "Warning, ngrid should be equal to n*order + 1. Corrected ngrid to %d.\n", ngrid);
+	if ((cfg.ngrid-1)/cfg.order != 
+			(cfg.ngrid-1)*1.0/cfg.order) {
+		cfg.ngrid = (cfg.ngrid-1)/cfg.order * cfg.order + cfg.order + 1;
+		fprintf(stderr, "Warning, ngrid should be equal to n*order + 1. Corrected ngrid to %d.\n", cfg.ngrid);
 	}
 	
 	// Reserve memory for output KL modes and eigenvalues
-	gsl_vector *kl_eigenv = gsl_vector_alloc(ALLOCSIZE);
-	gsl_matrix *kl_eigenf = gsl_matrix_alloc(ngrid, ALLOCSIZE);
-	int kl_nmodes = 0;
-	int kl_nalloc = ALLOCSIZE;
+	struct _kl_modes kl_modes;
 	
-	// Tabulate function A1(r) and calculate constant A2 (Dai Eqn. 23 and 24)
-	printf("Calculating A1(r) and A2...\n");
-	gsl_vector *A1 = gsl_vector_alloc(ngrid);
-	double A2;
-
-	if (cache && !gsl_restore_vector("klbasis-A1.gsl", A1)) {
-		printf("Restored A1 from cache.\n");
-	}
-	else {
-		for (int r=0; r<ngrid; r++)
-			gsl_vector_set(A1, r, calc_A1((double) r /(ngrid-1.0)));
-	}
-	
-	A2 = calc_A2();
-	printf("Found A2 = %.16f\n", A2);
-	
-	if (cache)
-		gsl_store_vector("klbasis-A1", A1, true, true, "%.16f");
+	kl_modes.eigv = gsl_vector_calloc(ALLOCSIZE);
+	kl_modes.eigf = gsl_matrix_alloc(cfg.ngrid, ALLOCSIZE);
+	kl_modes.pq = gsl_matrix_uint_alloc(2, ALLOCSIZE);
+	kl_modes.limit = 0.0;
+	kl_modes.nm = 0;
+	kl_modes.nalloc = ALLOCSIZE;
+	pthread_mutex_init(&(kl_modes.lock), NULL);
 	
 	// Loop over all q, start at maxQ because that will determine the 
 	// eigenvalue cutoff for further KL modes
-	int q=maxQ;
+	calc_kl(cfg.maxQ, &cfg, &kl_modes);
 	
-	gsl_matrix *kernelS, *weightMat;
-	gsl_eigen_symmv_workspace *w = gsl_eigen_symmv_alloc(ngrid);
-	gsl_vector * eigenV = gsl_vector_alloc(ngrid);
-	gsl_matrix * eigenF = gsl_matrix_alloc(ngrid, ngrid);
+	// Setup threads
+	struct thr_info threads[cfg.nthreads];
+	cfg.threads = (pthread_t *) malloc((cfg.nthreads) * (sizeof(pthread_t)));
+	
+	for (int t=0; t<cfg.nthreads; t++) {
+		threads[t].id = t;
+		threads[t].minq = t;
+		threads[t].maxq = cfg.maxQ;
+		threads[t].cfg = &cfg;
+		threads[t].kl_modes = &kl_modes;
 
-	// Try to load from cache
-	if (cache &&
-			!gsl_restore_matrix(format("klbasis-eigenF_q=%d.gsl", q), eigenF) &&
-			!gsl_restore_vector(format("klbasis-eigenV_q=%d.gsl", q), eigenV))
-		printf("Restored first set of eigenfunction & -values for q=%d from cache.\n", q);
-	// Otherwise calculate...
-	else {
-		printf("Calculating intergration kernel S_q=%d...\n", q);
-		// Build kernel matrix S_q (Dai Eqn. 42)
-		kernelS = calc_kernel(q, order, ngrid, &weightMat);
-		printf("Solving eigensystem...\n");
-		// Solve eigensystem into eigenfunctions & -values
-		gsl_eigen_symmv (kernelS, eigenV, eigenF, w);
+		pthread_create(&cfg.threads[t], NULL, thread_worker, (void *)(threads+t));
 	}
 	
-	// Cache to disk
-	if (cache) {
-		gsl_store_matrix(format("klbasis-eigenF_q=%d", q), eigenF, true, true);
-		gsl_store_vector(format("klbasis-eigenV_q=%d", q), eigenV, true, true);
+	// Wait for threads here
+	for (int t=0; t<cfg.nthreads; t++) {
+		pthread_join(cfg.threads[t], NULL);
 	}
-	
-	double limit = gsl_vector_get(eigenV, 1);
-	int p = 1;
-	printf("Keeping first eigenvalue @ q=%d, p=%d, value=%.16f\n", q, p, limit);
 
-	// Loop over all other values of q
-	for (q=maxQ-1; q>=minQ; q--) {
-		if (cache &&
-			!gsl_restore_matrix(format("klbasis-eigenF_q=%d.gsl", q), eigenF) &&
-			!gsl_restore_vector(format("klbasis-eigenV_q=%d.gsl", q), eigenV))
-			printf("Restored eigenfunction & -values for q=%d from cache.\n", q);
-		else {
-			printf("Calculating intergration kernel S_q=%d...\n", q);
-			kernelS = calc_kernel(q, order, ngrid, &weightMat);
-			printf("Solving eigensystem...\n");
-			gsl_eigen_symmv (kernelS, eigenV, eigenF, w);
-		}
-		
-		if (cache) {
-			gsl_store_matrix(format("klbasis-eigenF_q=%d", q), eigenF, true, true);
-			gsl_store_vector(format("klbasis-eigenV_q=%d", q), eigenV, true, true);
-		}
-		
-		// Keep all eigenfunctions & -values >= limit
-		p=1;
-		for (int i=1; gsl_vector_get(eigenV, i)>=limit; i++, p++) {
-			double vec = gsl_vector_get(eigenV, i);
-			if (vec < 0) {
-				printf("Eigenvalue @ q=%d, p=%d, value=%g is negative! Abort!\n", q, p, vec);
-				exit(-1);
-			}
-			printf("Keeping eigenvalue @ q=%d, p=%d, value=%.16f\n", q, p, vec);
-		}
-		
-		// Normalize and convert to Karhunen-Loève functions
-		
+//	for (int n=0; n<kl_modes.nm; n++) {
+//		unsigned int p = gsl_matrix_uint_get(kl_modes.pq, 0, n);
+//		unsigned int q =  gsl_matrix_uint_get(kl_modes.pq, 1, n);
+//		double val = gsl_vector_get(kl_modes.eigv, n);
+//		//printf("Mode n=%d, p=%d, q=%d: %g\n", n, p, q, val);
+//	}
+	
+	// Sort vectors
+	gsl_permutation * p = gsl_permutation_alloc(kl_modes.nalloc);
+	gsl_sort_vector_index (p, kl_modes.eigv);
+	
+	for (int n=kl_modes.nalloc-1; n>=(kl_modes.nalloc-kl_modes.nm); n--) {
+		int idx = gsl_permutation_get(p, n);
+		unsigned int p = gsl_matrix_uint_get(kl_modes.pq, 0, idx);
+		unsigned int q =  gsl_matrix_uint_get(kl_modes.pq, 1, idx);
+		double val = gsl_vector_get(kl_modes.eigv, idx);
+		printf("Mode p=%d, q=%d:  %g\n", p, q, val);
+		if (q != 0)
+			printf("Mode p=%d, q=%d: %g\n", p, -q, val);
+			
 	}
 	
+	// Store final eigenfunctions and eigenvalues
+	printf("Storing final results to disk.\n");
+	
+	gsl_store_matrix(format("klbasis-eigenmodes", cfg.maxQ), kl_modes.eigf, true, true);
+	gsl_store_vector(format("klbasis-eigenvalues", cfg.maxQ), kl_modes.eigv, true, true);
+
 	return 0;
 }

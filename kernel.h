@@ -18,7 +18,7 @@
 gsl_matrix *calc_kernel(int q, int order, int ngrid, gsl_matrix **weightMat);
 gsl_matrix *calc_weights(int order, int ngrid);
 int newtoncotes_factors(int order, double factors[]);
-double calc_Sq(double r, double rp, int q);
+double calc_Sq(int q, int i, int j, int ngrid, double *A1, double A2);
 double calc_Sq_f1(double thpp, void *params);
 double calc_Sq_f1c(double thpp, void *params);
 
