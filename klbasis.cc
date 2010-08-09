@@ -75,6 +75,7 @@ void *thread_worker(void *arg) {
 
 int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
 	//printf("Calculating KL modes for q=%d. order=%d, ngrid=%d\n", q, cfg->order, cfg->ngrid);
+	// TODO: Update ngrid dynamically
 	gsl_matrix *kernelS, *weightMat;	// Integration kernel to be inverted
 	gsl_eigen_symmv_workspace *w = gsl_eigen_symmv_alloc(cfg->ngrid);
 	gsl_vector *tmp_col = gsl_vector_alloc(cfg->ngrid);
