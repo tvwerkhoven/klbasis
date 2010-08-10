@@ -1,7 +1,7 @@
 ## @file configure.ac
 ## @author Tim van Werkhoven (t.i.m.vanwerkhoven@xs4all.nl)
 
-AC_INIT([KLBASIS], [0.1], [t.i.m.vanwerkhoven@xs4all.nl])
+AC_INIT([klbasis], [0.1], [t.i.m.vanwerkhoven@xs4all.nl])
 
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_FILES([
