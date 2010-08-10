@@ -58,13 +58,14 @@ void show_clihelp(char *execname, bool error = false) {
 void *thread_worker(void *arg) {
 	thr_info *info = (thr_info *) arg;
 	int id = info->id;
+	int q=0, n=0, lastn=0;
 	struct _kl_modes *kl_modes = info->kl_modes;
 	struct _kl_config *cfg = info->cfg;
 	
 	// Now calculate the rest, loop over all other values of q
-	for (int q=id; ; q += cfg->nthreads) {
+	for (q=id; ; q += cfg->nthreads) {
 		printf("Thread %d working on Q=%d.\n", id, q);
-		int n = calc_kl(q, cfg, kl_modes);
+		n = calc_kl(q, cfg, kl_modes);
 		
 		// If maxQ is set, stop when we reach this q
 		if (cfg->maxQ != -1 && q>=cfg->maxQ)
@@ -72,6 +73,15 @@ void *thread_worker(void *arg) {
 		// If no more eigenvalues are above the cutoff limit, we're done
 		else if (n == 0)
 			break;
+		// More modes than previous round? Impossible, must be numerical error
+		if (n > lastn && q!=id) {
+			fprintf(stderr, "Thread %d ran into numerical error: got more eigenmodes for q=%d (%d) than q=%d (%d)", \
+					id, q, n, q-cfg->nthreads, lastn);
+			break;
+		}
+		
+		lastn = n;
+		printf("Thread %d got %d modes for Q=%d.\n", id, n, q);
 	}
 	printf("Thread %d stopped @ Q=%d.\n", id, q);
 	return NULL;
@@ -302,16 +312,20 @@ int main(int argc, char *argv[]) {
 	gsl_sort_vector_index (p, kl_modes.eigv);
 	
 	// Print list of eigenvalues in descending order
+	double val=0, sum=0;
 	for (int n=kl_modes.nalloc-1; n>=(kl_modes.nalloc-kl_modes.nm); n--) {
 		int idx = gsl_permutation_get(p, n);
 		unsigned int p = gsl_matrix_uint_get(kl_modes.pq, 0, idx);
 		unsigned int q =  gsl_matrix_uint_get(kl_modes.pq, 1, idx);
-		double val = gsl_vector_get(kl_modes.eigv, idx);
-		printf("Mode p=%d, q=%d:  %g\n", p, q, val);
-		if (q != 0)
-			printf("Mode p=%d, q=%d: %g\n", p, -q, val);
-			
+		val = gsl_vector_get(kl_modes.eigv, idx);
+		sum += val;
+		printf("Mode p=%4d, q=%+4d: %g\n", p, q, val);
+		if (q != 0) {
+			sum += val;
+			printf("Mode p=%4d, q=%+4d: %g\n", p, -q, val);
+		}
 	}
+	printf("Total eigenvalue sum for %d modes: %.16f\n", kl_modes.nm, sum);
 	
 	// Store final eigenfunctions and eigenvalues
 	printf("Storing results to disk.\n");
