@@ -30,11 +30,11 @@
 #include "klbasis.h"
 
 void show_version() {
-	printf("klbasis (version 0.1, built %s %s)\n", __DATE__, __TIME__);
-	printf("Copyright (c) 2010 Tim van Werkhoven <T.I.M.vanWerkhoven@xs4all.nl>\n");
-	printf("\nFOAM comes with ABSOLUTELY NO WARRANTY. This is free software,\n"
+	printf("%s (version %s, built %s %s)\n", PACKAGE_NAME, PACKAGE_VERSION, __DATE__, __TIME__);
+	printf("Copyright (c) 2010 Tim van Werkhoven <%s>\n", PACKAGE_BUGREPORT);
+	printf("\n%s comes with ABSOLUTELY NO WARRANTY. This is free software,\n"
 		   "and you are welcome to redistribute it under certain conditions;\n"
-		   "see the file COPYING for details.\n");
+		   "see the file COPYING for details.\n", PACKAGE_NAME);
 }
 
 void show_clihelp(char *execname, bool error = false) {
@@ -46,34 +46,41 @@ void show_clihelp(char *execname, bool error = false) {
 			   "      --maxq=N         Solve KL functions up to q=N.\n"
 			   "      --minq=N         Solve KL functions from q=N.\n"
 			   "  -o, --order=N        Use interpolation order N.\n"
+			   "  -l, --limit=L        Use this limit as eigenvalue cutoff.\n"
 			   "  -t, --threads=N      Number of threads to use.\n"
-			   "      --cache          Cache intermediate results.\n"
+			   "      --cache          Cache intermediate results or re-use them.\n"
 			   "  -h, --help           Display this help message.\n"
 			   "      --version        Display version information.\n\n");
-		printf("Report bugs to Tim van Werkhoven <T.I.M.vanWerkhoven@xs4all.nl>.\n");
+		printf("Report bugs to Tim van Werkhoven <%s>.\n", PACKAGE_BUGREPORT);
 	}
 }
 
 void *thread_worker(void *arg) {
 	thr_info *info = (thr_info *) arg;
 	int id = info->id;
-	int minq = info->minq;
-	int maxq = info->maxq;
 	struct _kl_modes *kl_modes = info->kl_modes;
 	struct _kl_config *cfg = info->cfg;
 	
 	// Now calculate the rest, loop over all other values of q
-	for (int q=minq; q<=maxq; q += cfg->nthreads) {
+	for (int q=id; ; q += cfg->nthreads) {
 		printf("Thread %d working on Q=%d.\n", id, q);
-		calc_kl(q, cfg, kl_modes);
+		int n = calc_kl(q, cfg, kl_modes);
+		
+		// If maxQ is set, stop when we reach this q
+		if (cfg->maxQ != -1 && q>=cfg->maxQ)
+			break;
+		// If no more eigenvalues are above the cutoff limit, we're done
+		else if (n == 0)
+			break;
 	}
-	
+	printf("Thread %d stopped @ Q=%d.\n", id, q);
 	return NULL;
 }
 
 int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
 	//printf("Calculating KL modes for q=%d. order=%d, ngrid=%d\n", q, cfg->order, cfg->ngrid);
 	// TODO: Update ngrid dynamically
+	int p=0;
 	gsl_matrix *kernelS, *weightMat;	// Integration kernel to be inverted
 	gsl_eigen_symmv_workspace *w = gsl_eigen_symmv_alloc(cfg->ngrid);
 	gsl_vector *tmp_col = gsl_vector_alloc(cfg->ngrid);
@@ -96,17 +103,17 @@ int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
 	}
 	
 	// First set gets special treatment
-	if (out->limit == 0.0) {
-		out->limit = gsl_vector_get(eigenV, 1);
-		int p = 1;
-		printf("Keeping first eigenvalue @ q=%d, p=%d, value=%.16f\n", q, p, out->limit);
+	if (cfg->limit == 0.0) {
+		cfg->limit = gsl_vector_get(eigenV, 1);
+		p++;
+		printf("Keeping first eigenvalue @ q=%d, p=%d, value=%.16f\n", q, p, cfg->limit);
 		
 		if (out->nm == out->nalloc) {
 			fprintf(stderr, "Please increase ALLOCSIZE...\n");
 			exit(-1);
 		}
 
-		gsl_vector_set(out->eigv, out->nm, out->limit);
+		gsl_vector_set(out->eigv, out->nm, cfg->limit);
 		gsl_matrix_get_col(tmp_col, eigenF, 1);
 		gsl_matrix_set_col(out->eigf, out->nm, tmp_col);
 		gsl_matrix_uint_set(out->pq, 0, out->nm, p);
@@ -115,8 +122,8 @@ int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
 	}
 	// Store regular modes & values here
 	else {
-		int p=1;
-		for (int i=1; i<cfg->ngrid && gsl_vector_get(eigenV, i)>=out->limit; i++, p++) {
+		for (int i=1; i<cfg->ngrid && gsl_vector_get(eigenV, i)>=cfg->limit; i++) {
+			p++;
 			double vec = gsl_vector_get(eigenV, i);
 			if (vec < 0) {
 				fprintf(stderr, "Eigenvalue @ q=%d, p=%d, value=%g is negative! Abort!\n", q, p, vec);
@@ -168,7 +175,7 @@ int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
 		gsl_store_vector(format("klcache-eigenV_q=%d", q), eigenV, true, true);
 	}
 	
-	return 0;
+	return p;
 }
 
 
@@ -181,7 +188,8 @@ int main(int argc, char *argv[]) {
 	cfg.order = 4;
 	cfg.cache = 0;
 	cfg.minQ = 0;
-	cfg.maxQ = 2;
+	cfg.maxQ = -1;
+	cfg.limit = 0.0;
 	cfg.nthreads = 2;
 
 	static struct option const long_options[] = {
@@ -190,13 +198,14 @@ int main(int argc, char *argv[]) {
 		{"maxq", required_argument, NULL, 3},
 		{"minq", required_argument, NULL, 4},
 		{"order", required_argument, NULL, 'o'},
+		{"limit", required_argument, NULL, 'l'},
 		{"help", no_argument, NULL, 'h'},
 		{"version", no_argument, NULL, 1},
 		{"cache", no_argument, NULL, 2},
 		{NULL, 0, NULL, 0}
 	};
 	
-	while((r = getopt_long(argc, argv, "c:hvt:n:o:", long_options, &option_index)) != EOF) {
+	while((r = getopt_long(argc, argv, "c:hvt:n:o:l:", long_options, &option_index)) != EOF) {
 		switch(r) {
 			case 0:
 				break;
@@ -218,6 +227,9 @@ int main(int argc, char *argv[]) {
 			case 't':
 				cfg.nthreads = atoi(optarg);
 				break;
+			case 'l':
+				cfg.limit = atof(optarg);
+				break;
 			case 3:
 				cfg.maxQ = atoi(optarg);
 				break;
@@ -233,11 +245,23 @@ int main(int argc, char *argv[]) {
 	}
 	
 	// Check options
+	if (cfg.maxQ == -1 && cfg.limit == 0) {
+		fprintf(stderr, "Error, need either maxQ set or a limit of eigenvalues to use.\n");
+		exit(-1);
+	}
+	else if (cfg.maxQ != -1 && cfg.limit != 0) {
+		fprintf(stderr, "Error, cannot use maxQ and limit simultaneously.\n");
+		exit(-1);
+	}
+	
 	if ((cfg.ngrid-1)/cfg.order != 
 			(cfg.ngrid-1)*1.0/cfg.order) {
 		cfg.ngrid = (cfg.ngrid-1)/cfg.order * cfg.order + cfg.order + 1;
 		fprintf(stderr, "Warning, ngrid should be equal to n*order + 1. Corrected ngrid to %d.\n", cfg.ngrid);
 	}
+	
+	printf("%s starting. ngrid=%d, order=%d, cache=%d, q=%d--%d, limit=%g.\n", \
+		   PACKAGE_NAME, cfg.ngrid, cfg.order, cfg.cache, cfg.minQ, cfg.maxQ, cfg.limit);
 	
 	// Reserve memory for output KL modes and eigenvalues
 	struct _kl_modes kl_modes;
@@ -245,14 +269,16 @@ int main(int argc, char *argv[]) {
 	kl_modes.eigv = gsl_vector_calloc(ALLOCSIZE);
 	kl_modes.eigf = gsl_matrix_alloc(cfg.ngrid, ALLOCSIZE);
 	kl_modes.pq = gsl_matrix_uint_alloc(2, ALLOCSIZE);
-	kl_modes.limit = 0.0;
 	kl_modes.nm = 0;
 	kl_modes.nalloc = ALLOCSIZE;
 	pthread_mutex_init(&(kl_modes.lock), NULL);
 	
-	// Loop over all q, start at maxQ because that will determine the 
-	// eigenvalue cutoff for further KL modes
-	calc_kl(cfg.maxQ, &cfg, &kl_modes);
+	if (cfg.maxQ != -1) {
+		// If maxQ is set, calculate KL modes once for this Q to determine 
+		// the cutoff value (limit) for eigenvalues
+		calc_kl(cfg.maxQ, &cfg, &kl_modes);
+		cfg.maxQ--;
+	}
 	
 	// Setup threads
 	struct thr_info threads[cfg.nthreads];
@@ -260,8 +286,6 @@ int main(int argc, char *argv[]) {
 	
 	for (int t=0; t<cfg.nthreads; t++) {
 		threads[t].id = t;
-		threads[t].minq = t;
-		threads[t].maxq = cfg.maxQ;
 		threads[t].cfg = &cfg;
 		threads[t].kl_modes = &kl_modes;
 
@@ -272,18 +296,12 @@ int main(int argc, char *argv[]) {
 	for (int t=0; t<cfg.nthreads; t++) {
 		pthread_join(cfg.threads[t], NULL);
 	}
-
-//	for (int n=0; n<kl_modes.nm; n++) {
-//		unsigned int p = gsl_matrix_uint_get(kl_modes.pq, 0, n);
-//		unsigned int q =  gsl_matrix_uint_get(kl_modes.pq, 1, n);
-//		double val = gsl_vector_get(kl_modes.eigv, n);
-//		//printf("Mode n=%d, p=%d, q=%d: %g\n", n, p, q, val);
-//	}
 	
 	// Sort vectors
 	gsl_permutation * p = gsl_permutation_alloc(kl_modes.nalloc);
 	gsl_sort_vector_index (p, kl_modes.eigv);
 	
+	// Print list of eigenvalues in descending order
 	for (int n=kl_modes.nalloc-1; n>=(kl_modes.nalloc-kl_modes.nm); n--) {
 		int idx = gsl_permutation_get(p, n);
 		unsigned int p = gsl_matrix_uint_get(kl_modes.pq, 0, idx);
@@ -296,7 +314,7 @@ int main(int argc, char *argv[]) {
 	}
 	
 	// Store final eigenfunctions and eigenvalues
-	printf("Storing final results to disk.\n");
+	printf("Storing results to disk.\n");
 	
 	gsl_store_matrix(format("klbasis-eigenmodes", cfg.maxQ), kl_modes.eigf, true, true);
 	gsl_store_vector(format("klbasis-eigenvalues", cfg.maxQ), kl_modes.eigv, true, true);

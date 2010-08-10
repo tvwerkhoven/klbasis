@@ -29,6 +29,7 @@ struct _kl_config {
 	int cache;			// Cache intermediate results
 	int maxQ;			// Maximum value of q to try
 	int minQ;			// Minimum value of q to try
+	double limit;		// Cut-off value for eigenvalues
 	int nthreads;		// Number of threads to use
 	pthread_t *threads;
 };
@@ -37,7 +38,6 @@ struct _kl_modes {
 	gsl_vector *eigv;
 	gsl_matrix *eigf;
 	gsl_matrix_uint *pq;	
-	double limit;
 	int nm;
 	int nalloc;
 	pthread_mutex_t lock;	// Lock for writing to kl_modes
