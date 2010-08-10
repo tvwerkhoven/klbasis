@@ -5,9 +5,6 @@
  See also Roddier (1990), Wang et al. (1978), Noll (1976) for further 
  reference.
  
- Compile with:
-	g++ -O3 -Wall -L/sw/lib -I/sw/include -lgsl -lgslcblas util.cc a1a2.cc kernel.cc klbasis.cc -o klbasis
- 
  (c) Tim van Werkhoven <t.i.m.vanwerkhoven@xs4all.nl> 2010
  
  This work is licensed under the Creative Commons Attribution-NonCommercial-
@@ -49,6 +46,7 @@ void show_clihelp(char *execname, bool error = false) {
 			   "      --maxq=N         Solve KL functions up to q=N.\n"
 			   "      --minq=N         Solve KL functions from q=N.\n"
 			   "  -o, --order=N        Use interpolation order N.\n"
+			   "  -t, --threads=N      Number of threads to use.\n"
 			   "      --cache          Cache intermediate results.\n"
 			   "  -h, --help           Display this help message.\n"
 			   "      --version        Display version information.\n\n");
@@ -128,7 +126,7 @@ int calc_kl(int q, struct _kl_config *cfg, struct _kl_modes* out) {
 			
 			pthread_mutex_lock(&(out->lock));
 			if (out->nm == out->nalloc) {
-				// Allocate new bigger data
+				// Allocate new bigger memory block
 				gsl_vector *tmp_eigv = gsl_vector_calloc(out->nalloc + ALLOCSIZE);
 				gsl_matrix *tmp_eigf = gsl_matrix_alloc(cfg->ngrid, out->nalloc + ALLOCSIZE);
 				gsl_matrix_uint *tmp_pq = gsl_matrix_uint_alloc(2, out->nalloc + ALLOCSIZE);
